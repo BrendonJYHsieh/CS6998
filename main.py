@@ -1,10 +1,11 @@
-import torch
-import torch.nn as nn
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from torch.utils.data import Dataset, DataLoader
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
 
 # Load data
 df = pd.read_csv('deduplicated_part_0.csv')
@@ -19,12 +20,21 @@ tls_feature_columns = [
 
 # Tokenize hex strings into 4-char tokens, prefixed with column name
 def tokenize_hex(hex_string, column_name):
+    if column_name == 'Client Cipher Suites':
+        column_name = 'CCS'
+    if column_name == 'TLS Extension Types':
+        column_name = 'TET'
+    if column_name == 'TLS Extension Lengths':
+        column_name = 'TEL'
+    if column_name == 'TLS Elliptic Curves':
+        column_name = 'TEC'
+        
     if not isinstance(hex_string, str):
         return []
     # Use 4-character tokens instead of 2-character
     tokens = [hex_string[i:i+4] for i in range(0, len(hex_string), 4)]
     # Make tokens unique based on column by prefixing with column identifier
-    return [f"{column_name[:3]}_{token}" for token in tokens]
+    return [f"{column_name}_{token}" for token in tokens]
 
 # Build vocabulary from all features
 all_tokens = set()
@@ -55,167 +65,86 @@ def convert_to_indices(hex_string, column_name, max_len):
     else:
         return indices + [0] * (max_len - len(indices))
 
-# Custom dataset class
-class TLSDataset(Dataset):
-    def __init__(self, dataframe, feature_cols, token_to_idx, max_length):
-        self.df = dataframe
-        self.feature_cols = feature_cols
-        self.token_to_idx = token_to_idx
-        self.max_length = max_length
-        
-    def __len__(self):
-        return len(self.df)
-    
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        
-        # Process each feature column
-        features = []
-        for col in self.feature_cols:
-            indices = convert_to_indices(row[col], col, self.max_length)
-            features.append(indices)
-        
-        # Stack features
-        x = torch.tensor(features, dtype=torch.long)
-        y = torch.tensor(row['OS_encoded'], dtype=torch.long)
-        
-        return x, y
-
 # Split data
 train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
 
-# Create datasets
-train_dataset = TLSDataset(train_df, tls_feature_columns, token_to_idx, max_length)
-test_dataset = TLSDataset(test_df, tls_feature_columns, token_to_idx, max_length)
-
-# Create dataloaders
-batch_size = 32
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size)
-
-# Model definition
-class TLSFingerprint(nn.Module):
-    def __init__(self, vocab_size, embed_dim, hidden_dim, num_classes, num_features):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        
-        # LSTM for each feature
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
-        
-        # Fully connected layers
-        self.fc1 = nn.Linear(hidden_dim * num_features, hidden_dim)
-        self.dropout = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(hidden_dim, num_classes)
-        
-    def forward(self, x):
-        # x shape: [batch_size, num_features, max_length]
-        batch_size, num_features, _ = x.shape
-        
-        feature_outputs = []
-        for i in range(num_features):
-            # Get feature tokens
-            feature_tokens = x[:, i, :]  # [batch_size, max_length]
+# Feature engineering for traditional ML models
+def prepare_ml_features(df, feature_cols, vectorizers=None, train=False):
+    # Join all hex strings for each feature with spaces
+    features = {}
+    for col in feature_cols:
+        features[col] = df[col].fillna('').astype(str)
+    
+    # Create or use vectorizers for each feature column
+    if vectorizers is None:
+        vectorizers = {}
+    
+    transformed_features = []
+    
+    for col in feature_cols:
+        if train:
+            # Only fit vectorizers on training data
+            vectorizers[col] = CountVectorizer(analyzer=lambda x: tokenize_hex(x, col), 
+                                              binary=True, max_features=1000)
+            feature_matrix = vectorizers[col].fit_transform(features[col])
+        else:
+            # Use pre-fitted vectorizers for test data
+            feature_matrix = vectorizers[col].transform(features[col])
             
-            # Embed tokens
-            embedded = self.embedding(feature_tokens)  # [batch_size, max_length, embed_dim]
-            
-            # Pass through LSTM
-            lstm_out, (h_n, _) = self.lstm(embedded)
-            
-            # Use the last hidden state
-            feature_outputs.append(h_n.squeeze(0))
-            
-        # Concatenate all feature representations
-        combined = torch.cat(feature_outputs, dim=1)  # [batch_size, num_features * hidden_dim]
-        
-        # Pass through fully connected layers
-        x = self.fc1(combined)
-        x = torch.relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        
-        return x
+        transformed_features.append(feature_matrix)
+    
+    # Combine all features horizontally
+    X = np.hstack([f.toarray() for f in transformed_features])
+    y = df['OS_encoded'].values
+    
+    return X, y, vectorizers
 
-# Hyperparameters
-embed_dim = 64
-hidden_dim = 128
-learning_rate = 0.001
-num_epochs = 30
+# Prepare features for ML models - fit on training data
+X_train, y_train, vectorizers = prepare_ml_features(train_df, tls_feature_columns, train=True)
+print(f"Training feature matrix shape: {X_train.shape}")
 
-# Initialize model
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = TLSFingerprint(
-    vocab_size=vocab_size, 
-    embed_dim=embed_dim, 
-    hidden_dim=hidden_dim, 
-    num_classes=num_classes,
-    num_features=len(tls_feature_columns)
-).to(device)
+# Train Decision Tree model
+dt_model = DecisionTreeClassifier(max_depth=10, random_state=42)
+dt_model.fit(X_train, y_train)
+print("Decision Tree model trained.")
 
-# Loss and optimizer
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+# Train Random Forest model
+rf_model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+rf_model.fit(X_train, y_train)
+print("Random Forest model trained.")
 
-# Training loop
-for epoch in range(num_epochs):
-    model.train()
-    total_loss = 0
-    
-    for batch_x, batch_y in train_loader:
-        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-        
-        # Forward pass
-        outputs = model(batch_x)
-        loss = criterion(outputs, batch_y)
-        
-        # Backward and optimize
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-    
-    # Print training stats
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(train_loader):.4f}')
-    
-    # Evaluation every 5 epochs
-    if (epoch + 1) % 5 == 0:
-        model.eval()
-        with torch.no_grad():
-            correct = 0
-            total = 0
-            for batch_x, batch_y in test_loader:
-                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-                outputs = model(batch_x)
-                _, predicted = torch.max(outputs.data, 1)
-                total += batch_y.size(0)
-                correct += (predicted == batch_y).sum().item()
-            
-            print(f'Test Accuracy: {100 * correct / total:.2f}%')
+# Evaluate models on test set - use pre-fitted vectorizers
+X_test, y_test, _ = prepare_ml_features(test_df, tls_feature_columns, vectorizers=vectorizers, train=False)
+print(f"Test feature matrix shape: {X_test.shape}")
 
-# Final evaluation
-model.eval()
-with torch.no_grad():
-    all_predictions = []
-    all_labels = []
-    
-    for batch_x, batch_y in test_loader:
-        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-        outputs = model(batch_x)
-        _, predicted = torch.max(outputs.data, 1)
-        
-        all_predictions.extend(predicted.cpu().numpy())
-        all_labels.extend(batch_y.cpu().numpy())
-    
-    # Convert numeric predictions back to labels
-    predicted_os = label_encoder.inverse_transform(all_predictions)
-    true_os = label_encoder.inverse_transform(all_labels)
-    
-    # Calculate accuracy
-    accuracy = (predicted_os == true_os).mean()
-    print(f'Final accuracy: {accuracy * 100:.2f}%')
-    
-    # Optional: Display confusion matrix
-    from sklearn.metrics import confusion_matrix, classification_report
-    print(confusion_matrix(true_os, predicted_os))
-    print(classification_report(true_os, predicted_os))
+# Evaluate Decision Tree
+dt_predictions = dt_model.predict(X_test)
+dt_accuracy = accuracy_score(y_test, dt_predictions)
+print(f"\nDecision Tree Accuracy: {dt_accuracy:.4f}")
+print("Decision Tree Classification Report:")
+print(classification_report(y_test, dt_predictions, target_names=label_encoder.classes_))
+
+# Evaluate Random Forest
+rf_predictions = rf_model.predict(X_test)
+rf_accuracy = accuracy_score(y_test, rf_predictions)
+print(f"\nRandom Forest Accuracy: {rf_accuracy:.4f}")
+print("Random Forest Classification Report:")
+print(classification_report(y_test, rf_predictions, target_names=label_encoder.classes_))
+
+# Compare model performances
+print("\nModel Comparison:")
+print(f"Decision Tree Accuracy: {dt_accuracy:.4f}")
+print(f"Random Forest Accuracy: {rf_accuracy:.4f}")
+
+# Feature importance analysis
+print("\nTop 10 most important features for Random Forest:")
+feature_names = []
+for col in tls_feature_columns:
+    names = [f"{col}_{f}" for f in vectorizers[col].get_feature_names_out()]
+    feature_names.extend(names)
+
+importances = rf_model.feature_importances_
+indices = np.argsort(importances)[::-1][:10]  # Top 10 features
+for i in indices:
+    if i < len(feature_names):
+        print(f"{feature_names[i]}: {importances[i]:.4f}")
