@@ -7,10 +7,10 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report
 
-# Load data
+# ----- Data Loading -----
 df = pd.read_csv('deduplicated_part_0.csv')
 
-# List of feature columns we'll use for tokenization
+# ----- Feature Definition -----
 tls_feature_columns = [
     'Client Cipher Suites', 
     'TLS Extension Types', 
@@ -18,45 +18,29 @@ tls_feature_columns = [
     'TLS Elliptic Curves'
 ]
 
-# Tokenize hex strings into 4-char tokens, prefixed with column name
+# ----- Feature Engineering Functions -----
 def tokenize_hex(hex_string, column_name):
-    if column_name == 'Client Cipher Suites':
-        column_name = 'CCS'
-    if column_name == 'TLS Extension Types':
-        column_name = 'TET'
-    if column_name == 'TLS Extension Lengths':
-        column_name = 'TEL'
-    if column_name == 'TLS Elliptic Curves':
-        column_name = 'TEC'
-        
+    """Tokenize hex strings into 4-char tokens, prefixed with column name."""
+    # Convert column names to shorter identifiers
+    column_mapping = {
+        'Client Cipher Suites': 'CCS',
+        'TLS Extension Types': 'TET',
+        'TLS Extension Lengths': 'TEL',
+        'TLS Elliptic Curves': 'TEC'
+    }
+    
+    prefix = column_mapping.get(column_name, column_name)
+    
     if not isinstance(hex_string, str):
         return []
+    
     # Use 4-character tokens instead of 2-character
     tokens = [hex_string[i:i+4] for i in range(0, len(hex_string), 4)]
     # Make tokens unique based on column by prefixing with column identifier
-    return [f"{column_name}_{token}" for token in tokens]
+    return [f"{prefix}_{token}" for token in tokens]
 
-# Build vocabulary from all features
-all_tokens = set()
-for column in tls_feature_columns:
-    for hex_string in df[column]:
-        all_tokens.update(tokenize_hex(hex_string, column))
-
-token_to_idx = {token: idx+1 for idx, token in enumerate(all_tokens)}  # 0 reserved for padding
-vocab_size = len(token_to_idx) + 1
-print(f"Vocabulary size: {vocab_size}")
-
-# Convert target variable to numeric
-label_encoder = LabelEncoder()
-df['OS_encoded'] = label_encoder.fit_transform(df['Ground Truth OS'])
-num_classes = len(label_encoder.classes_)
-print(f"OS classes: {label_encoder.classes_}")
-
-# Maximum sequence length for each feature
-max_length = 50  # Adjusted since we now have 4-char tokens instead of 2-char
-
-# Function to convert a hex string to token indices
 def convert_to_indices(hex_string, column_name, max_len):
+    """Convert a hex string to token indices."""
     tokens = tokenize_hex(hex_string, column_name)
     indices = [token_to_idx.get(token, 0) for token in tokens]
     # Pad or truncate to max_length
@@ -65,12 +49,9 @@ def convert_to_indices(hex_string, column_name, max_len):
     else:
         return indices + [0] * (max_len - len(indices))
 
-# Split data
-train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
-
-# Feature engineering for traditional ML models
 def prepare_ml_features(df, feature_cols, vectorizers=None, train=False):
-    # Join all hex strings for each feature with spaces
+    """Feature engineering for traditional ML models."""
+    # Process feature columns
     features = {}
     for col in feature_cols:
         features[col] = df[col].fillna('').astype(str)
@@ -99,10 +80,39 @@ def prepare_ml_features(df, feature_cols, vectorizers=None, train=False):
     
     return X, y, vectorizers
 
+# ----- Data Preprocessing -----
+# Build vocabulary from all features
+all_tokens = set()
+for column in tls_feature_columns:
+    for hex_string in df[column]:
+        all_tokens.update(tokenize_hex(hex_string, column))
+
+token_to_idx = {token: idx+1 for idx, token in enumerate(all_tokens)}  # 0 reserved for padding
+vocab_size = len(token_to_idx) + 1
+print(f"Vocabulary size: {vocab_size}")
+
+# Convert target variable to numeric
+label_encoder = LabelEncoder()
+df['OS_encoded'] = label_encoder.fit_transform(df['Ground Truth OS'])
+num_classes = len(label_encoder.classes_)
+print(f"OS classes: {label_encoder.classes_}")
+
+# Define sequence length
+max_length = 50  # Adjusted for 4-char tokens
+
+# ----- Train/Test Split -----
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+
+# ----- Feature Preparation -----
 # Prepare features for ML models - fit on training data
 X_train, y_train, vectorizers = prepare_ml_features(train_df, tls_feature_columns, train=True)
 print(f"Training feature matrix shape: {X_train.shape}")
 
+# Prepare test features
+X_test, y_test, _ = prepare_ml_features(test_df, tls_feature_columns, vectorizers=vectorizers, train=False)
+print(f"Test feature matrix shape: {X_test.shape}")
+
+# ----- Model Training -----
 # Train Decision Tree model
 dt_model = DecisionTreeClassifier(max_depth=10, random_state=42)
 dt_model.fit(X_train, y_train)
@@ -113,10 +123,7 @@ rf_model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=4
 rf_model.fit(X_train, y_train)
 print("Random Forest model trained.")
 
-# Evaluate models on test set - use pre-fitted vectorizers
-X_test, y_test, _ = prepare_ml_features(test_df, tls_feature_columns, vectorizers=vectorizers, train=False)
-print(f"Test feature matrix shape: {X_test.shape}")
-
+# ----- Model Evaluation -----
 # Evaluate Decision Tree
 dt_predictions = dt_model.predict(X_test)
 dt_accuracy = accuracy_score(y_test, dt_predictions)
@@ -131,6 +138,7 @@ print(f"\nRandom Forest Accuracy: {rf_accuracy:.4f}")
 print("Random Forest Classification Report:")
 print(classification_report(y_test, rf_predictions, target_names=label_encoder.classes_))
 
+# ----- Results Analysis -----
 # Compare model performances
 print("\nModel Comparison:")
 print(f"Decision Tree Accuracy: {dt_accuracy:.4f}")
