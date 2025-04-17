@@ -114,12 +114,12 @@ print(f"Test feature matrix shape: {X_test.shape}")
 
 # ----- Model Training -----
 # Train Decision Tree model
-dt_model = DecisionTreeClassifier(max_depth=10, random_state=42)
+dt_model = DecisionTreeClassifier(max_depth=None, random_state=42)
 dt_model.fit(X_train, y_train)
 print("Decision Tree model trained.")
 
 # Train Random Forest model
-rf_model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+rf_model = RandomForestClassifier(n_estimators=200, max_depth=None, random_state=42)
 rf_model.fit(X_train, y_train)
 print("Random Forest model trained.")
 
