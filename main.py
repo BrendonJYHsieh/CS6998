@@ -7,17 +7,7 @@ from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import Dataset, DataLoader
 
 # Load data
-df = pd.read_csv('2019-07-12-00_ground_truth_tls_only.csv')
-
-# Count original rows
-original_count = len(df)
-
-# Remove duplicate rows
-df = df.drop_duplicates()
-
-# Count removed rows
-duplicates_removed = original_count - len(df)
-print(f"Removed {duplicates_removed} duplicate rows.")
+df = pd.read_csv('deduplicated_part_0.csv')
 
 # List of feature columns we'll use for tokenization
 tls_feature_columns = [
@@ -27,17 +17,20 @@ tls_feature_columns = [
     'TLS Elliptic Curves'
 ]
 
-# Tokenize hex strings into 2-char tokens
-def tokenize_hex(hex_string):
+# Tokenize hex strings into 4-char tokens, prefixed with column name
+def tokenize_hex(hex_string, column_name):
     if not isinstance(hex_string, str):
         return []
-    return [hex_string[i:i+2] for i in range(0, len(hex_string), 2)]
+    # Use 4-character tokens instead of 2-character
+    tokens = [hex_string[i:i+4] for i in range(0, len(hex_string), 4)]
+    # Make tokens unique based on column by prefixing with column identifier
+    return [f"{column_name[:3]}_{token}" for token in tokens]
 
 # Build vocabulary from all features
 all_tokens = set()
 for column in tls_feature_columns:
     for hex_string in df[column]:
-        all_tokens.update(tokenize_hex(hex_string))
+        all_tokens.update(tokenize_hex(hex_string, column))
 
 token_to_idx = {token: idx+1 for idx, token in enumerate(all_tokens)}  # 0 reserved for padding
 vocab_size = len(token_to_idx) + 1
@@ -50,11 +43,11 @@ num_classes = len(label_encoder.classes_)
 print(f"OS classes: {label_encoder.classes_}")
 
 # Maximum sequence length for each feature
-max_length = 100  # You can adjust this based on your data
+max_length = 50  # Adjusted since we now have 4-char tokens instead of 2-char
 
 # Function to convert a hex string to token indices
-def convert_to_indices(hex_string, max_len):
-    tokens = tokenize_hex(hex_string)
+def convert_to_indices(hex_string, column_name, max_len):
+    tokens = tokenize_hex(hex_string, column_name)
     indices = [token_to_idx.get(token, 0) for token in tokens]
     # Pad or truncate to max_length
     if len(indices) > max_len:
@@ -79,7 +72,7 @@ class TLSDataset(Dataset):
         # Process each feature column
         features = []
         for col in self.feature_cols:
-            indices = convert_to_indices(row[col], self.max_length)
+            indices = convert_to_indices(row[col], col, self.max_length)
             features.append(indices)
         
         # Stack features
