@@ -55,6 +55,7 @@ class FlowerClient(Client):
 
     def fit(self, ins: FitIns) -> FitRes:
         global_round = int(ins.config["global_round"])
+        
         if global_round == 1:
             # First round local training
             bst = xgb.train(
@@ -94,6 +95,8 @@ class FlowerClient(Client):
 
     def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
         # Load global model
+        # print("tensors length eval:", len(ins.parameters.tensors))
+
         bst = xgb.Booster(params=self.params)
         para_b = bytearray(ins.parameters.tensors[0])
         bst.load_model(para_b)
