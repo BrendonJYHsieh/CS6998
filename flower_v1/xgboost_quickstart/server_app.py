@@ -2,11 +2,89 @@
 
 import os
 from typing import Dict, List, Tuple, Union
+import numpy as np
 
 import xgboost as xgb
 from flwr.common import Context, FitRes, Parameters, Scalar
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 from flwr.server.strategy import FedXgbBagging
+
+from xgboost_quickstart.dp_utils import SecureAggregation
+
+class PrivacyAwareFedXgbBagging(FedXgbBagging):
+    """Extended FedXgbBagging strategy with privacy features"""
+    
+    def __init__(
+        self,
+        *args,
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.use_secure_agg = True  # Enable secure aggregation by default
+        self.secure_agg_seed = np.random.randint(1, 1000000)  # Server-side seed
+        self.privacy_accounting = {
+            "total_epsilon": 0.0,
+            "total_delta": 0.0,
+            "num_rounds": 0
+        }
+    
+    def aggregate_fit(
+        self,
+        server_round: int,
+        results: List[Tuple[int, FitRes]],
+        failures: List[Union[Tuple[int, FitRes], BaseException]],
+    ):
+        """Aggregate model updates using secure aggregation if enabled."""
+        # First perform standard aggregation from FedXgbBagging
+        aggregated_result = super().aggregate_fit(server_round, results, failures)
+        
+        # If secure aggregation is enabled, remove the mask from the aggregated model
+        if self.use_secure_agg and aggregated_result is not None:
+            # Access the parameters
+            parameters = aggregated_result[0]
+            if parameters.tensors:
+                model_bytes = parameters.tensors[0]
+                
+                # Remove the secure mask from the aggregated model
+                unmasked_model_bytes = SecureAggregation.remove_secure_agg_mask(
+                    model_bytes, 
+                    self.secure_agg_seed
+                )
+                
+                # Update the parameters with the unmasked model
+                parameters.tensors[0] = unmasked_model_bytes
+        
+        # Update privacy accounting based on client metrics
+        if results:
+            round_epsilon = 0.0
+            round_delta = 0.0
+            num_clients = len(results)
+            
+            for _, fit_res in results:
+                client_metrics = fit_res.metrics
+                if "privacy_budget_epsilon" in client_metrics:
+                    round_epsilon += float(client_metrics["privacy_budget_epsilon"])
+                if "privacy_budget_delta" in client_metrics:
+                    round_delta += float(client_metrics["privacy_budget_delta"])
+            
+            # Average across clients
+            if num_clients > 0:
+                round_epsilon /= num_clients
+                round_delta /= num_clients
+                
+                # Update cumulative privacy accounting
+                self.privacy_accounting["total_epsilon"] += round_epsilon
+                self.privacy_accounting["total_delta"] += round_delta
+                self.privacy_accounting["num_rounds"] += 1
+                
+                print(f"Round {server_round} privacy metrics:")
+                print(f"  - ε (epsilon): {round_epsilon}")
+                print(f"  - δ (delta): {round_delta}")
+                print(f"Cumulative privacy expenditure:")
+                print(f"  - Total ε: {self.privacy_accounting['total_epsilon']}")
+                print(f"  - Total δ: {self.privacy_accounting['total_delta']}")
+        
+        return aggregated_result
 
 def evaluate_metrics_aggregation(eval_metrics: List[Tuple[int, Dict[str, Scalar]]]) -> Dict[str, Scalar]:
     """Aggregate evaluation metrics weighted by number of examples."""
@@ -58,7 +136,7 @@ def server_fn(context: Context) -> ServerAppComponents:
     parameters = Parameters(tensor_type="", tensors=[])
     
     # Define aggregation strategy
-    strategy = FedXgbBagging(
+    strategy = PrivacyAwareFedXgbBagging(
         fraction_fit=fraction_fit,
         fraction_evaluate=fraction_evaluate,
         min_fit_clients=min_fit_clients,
@@ -90,7 +168,17 @@ def server_fn(context: Context) -> ServerAppComponents:
                 # Save the model
                 os.makedirs("global_models", exist_ok=True)
                 bst.save_model("global_models/final_federated_model.json")
-                print("Global model saved successfully!")
+                
+                # Save privacy report
+                with open("global_models/privacy_report.txt", "w") as f:
+                    f.write("Privacy Report for Federated Learning\n")
+                    f.write("====================================\n\n")
+                    f.write(f"Total training rounds: {strategy.privacy_accounting['num_rounds']}\n")
+                    f.write(f"Final privacy budget expenditure:\n")
+                    f.write(f"  - Total ε (epsilon): {strategy.privacy_accounting['total_epsilon']}\n")
+                    f.write(f"  - Total δ (delta): {strategy.privacy_accounting['total_delta']}\n")
+                
+                print("Global model and privacy report saved successfully!")
             except Exception as e:
                 print(f"Error saving global model: {e}")
     

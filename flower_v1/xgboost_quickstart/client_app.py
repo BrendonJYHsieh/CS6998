@@ -3,6 +3,7 @@
 import warnings
 import os
 import joblib
+import random
 
 from flwr.common.context import Context
 import xgboost as xgb
@@ -19,6 +20,7 @@ from flwr.common import (
 )
 
 from xgboost_quickstart.task import load_data, replace_keys
+from xgboost_quickstart.dp_utils import apply_dp_to_xgboost, SecureAggregation
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -32,6 +34,7 @@ class FlowerClient(Client):
         num_val,
         num_local_round,
         params,
+        dp_config=None,
     ):
         self.train_dmatrix = train_dmatrix
         self.valid_dmatrix = valid_dmatrix
@@ -39,6 +42,8 @@ class FlowerClient(Client):
         self.num_val = num_val
         self.num_local_round = num_local_round
         self.params = params
+        self.dp_config = dp_config or {}
+        self.secure_mask_seed = random.randint(1, 1000000)
 
     def _local_boost(self, bst_input):
         # Update trees based on local training data
@@ -74,14 +79,37 @@ class FlowerClient(Client):
             # Local training
             bst = self._local_boost(bst)
 
+        # Apply differential privacy if configured
+        if self.dp_config.get("use_dp", False):
+            bst = apply_dp_to_xgboost(
+                bst,
+                epsilon=self.dp_config.get("epsilon", 1.0),
+                delta=self.dp_config.get("delta", 1e-5),
+                clip_norm=self.dp_config.get("clip_norm", 5.0),
+                mechanism=self.dp_config.get("mechanism", "laplace")
+            )
+            
         # Save model
         local_model = bst.save_raw("json")
         local_model_bytes = bytes(local_model)
+        
+        # Apply secure aggregation mask if enabled
+        if self.dp_config.get("use_secure_agg", False):
+            local_model_bytes, _ = SecureAggregation.apply_secure_agg_mask(
+                local_model_bytes, 
+                self.secure_mask_seed
+            )
 
         # Save local model for inspection
         client_dir = f"client_models/client_{ins.config.get('partition_id', 'unknown')}"
         os.makedirs(client_dir, exist_ok=True)
         bst.save_model(f"{client_dir}/model_round_{global_round}.json")
+
+        # Include privacy metrics in the response
+        metrics = {}
+        if self.dp_config.get("use_dp", False):
+            metrics["privacy_budget_epsilon"] = self.dp_config.get("epsilon", 1.0)
+            metrics["privacy_budget_delta"] = self.dp_config.get("delta", 1e-5)
 
         return FitRes(
             status=Status(
@@ -90,7 +118,7 @@ class FlowerClient(Client):
             ),
             parameters=Parameters(tensor_type="", tensors=[local_model_bytes]),
             num_examples=self.num_train,
-            metrics={},
+            metrics=metrics,
         )
 
     def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
@@ -148,6 +176,11 @@ class FlowerClient(Client):
             }
         else:
             metrics = {"accuracy": accuracy}
+            
+        # Add privacy metrics to evaluation results
+        if self.dp_config.get("use_dp", False):
+            metrics["privacy_budget_epsilon"] = self.dp_config.get("epsilon", 1.0)
+            metrics["privacy_budget_delta"] = self.dp_config.get("delta", 1e-5)
 
         return EvaluateRes(
             status=Status(
@@ -190,6 +223,16 @@ def client_fn(context: Context):
         os_labels = joblib.load(os_labels_path)
         params["num_class"] = len(os_labels)
     
+    # Get DP config from context if available
+    dp_config = cfg.get("dp_config", {
+        "use_dp": True,  # Enable DP by default
+        "epsilon": 1.0,  # Privacy budget
+        "delta": 1e-5,   # Privacy failure probability
+        "clip_norm": 5.0,  # Model parameter clipping threshold
+        "mechanism": "gaussian",  # Noise mechanism (laplace or gaussian)
+        "use_secure_agg": True,  # Enable secure aggregation
+    })
+    
     # Return Client instance
     return FlowerClient(
         train_dmatrix,
@@ -198,6 +241,7 @@ def client_fn(context: Context):
         num_val,
         num_local_round,
         params,
+        dp_config,
     )
 
 # Flower ClientApp
